@@ -31,7 +31,10 @@
 #include <applibs/storage.h>
 
 // By default, this sample is targeted at the MT3620 Reference Development Board (RDB).
-// This can be changed using the project property "Target Hardware Definition Directory".
+// This can be changed using the "AzureSphereTargetHardwareDefinitionDirectory" property in
+// CMakeSettings.json (for Visual Studio), or the value passed to
+// -DAZURE_SPHERE_TARGET_HARDWARE_DEFINITION_DIRECTORY when invoking cmake from the command line.
+//
 // This #include imports the sample_hardware abstraction from that hardware definition.
 #include <hw/sample_hardware.h>
 
