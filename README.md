@@ -1,3 +1,7 @@
+# Azure IOT Hub Garage Door Opener
+
+This application was created as part of a design challenge for Azure Sphere on Hackster.io. The code is modified from the original samples provided by microsoft for working with an IOT hub. Below is the original README provided by Microsoft describing setup of the sample.
+
 # Sample: AzureIoT
 
 This sample demonstrates how to use the Azure IoT SDK C APIs in an Azure Sphere application to communicate with Azure IoT Central or Azure IoT Hub. 
