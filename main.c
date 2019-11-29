@@ -1,10 +1,11 @@
 ﻿/* Copyright (c) Microsoft Corporation. All rights reserved.
    Licensed under the MIT License. */
 
-// This sample C application for Azure Sphere demonstrates Azure IoT SDK C APIs
+// Based on the sample C application for Azure Sphere demonstrating Azure IoT SDK C APIs provided by microsoft.
+
 // The application uses the Azure IoT SDK C APIs to
-// 1. Use the buttons to trigger sending telemetry to Azure IoT Hub/Central.
-// 2. Use IoT Hub/Device Twin to control an LED.
+// 1. Read the current position of two garage doors.
+// 2. Open two garage doors using relays connected to the switches on an opener remote.
 
 // You will need to provide four pieces of information to use this application, all of which are set
 // in the app_manifest.json.
@@ -50,7 +51,12 @@
 
 static volatile sig_atomic_t terminationRequired = false;
 
-#include "parson.h" // used to parse Device Twin messages.
+#include "parson.h"
+
+#define DOOR_ONE_CONTROL MT3620_GPIO0
+#define DOOR_TWO_CONTROL MT3620_GPIO1
+#define DOOR_ONE_STATUS MT3620_GPIO16
+#define DOOR_TWO_STATUS MT3620_GPIO17
 
 // Azure IoT Hub/Central defines.
 #define SCOPEID_LENGTH 20
@@ -60,37 +66,32 @@ static char scopeId[SCOPEID_LENGTH]; // ScopeId for the Azure IoT Central applic
 static IOTHUB_DEVICE_CLIENT_LL_HANDLE iothubClientHandle = NULL;
 static const int keepalivePeriodSeconds = 20;
 static bool iothubAuthenticated = false;
-static void SendMessageCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void *context);
-static void TwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsigned char *payload,
-                         size_t payloadSize, void *userContextCallback);
-static void TwinReportBoolState(const char *propertyName, bool propertyValue);
-static void ReportStatusCallback(int result, void *context);
+static int MethodCallback(const char* methodName, const unsigned char* payload, size_t size, unsigned char** response, size_t* response_size, void* userContextCallback);
+static void TwinReportStringState(const char* propertyName, const char* propertyValue);
+static void ReportStatusCallback(int result, void* context);
 static const char *GetReasonString(IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason);
 static const char *getAzureSphereProvisioningResultString(
     AZURE_SPHERE_PROV_RETURN_VALUE provisioningResult);
-static void SendTelemetry(const unsigned char *key, const unsigned char *value);
 static void SetupAzureClient(void);
-
-// Function to generate simulated Temperature data/telemetry
-static void SendSimulatedTemperature(void);
 
 // Initialization/Cleanup
 static int InitPeripheralsAndHandlers(void);
 static void ClosePeripheralsAndHandlers(void);
 
-// File descriptors - initialized to invalid value
-// Buttons
-static int sendMessageButtonGpioFd = -1;
-static int sendOrientationButtonGpioFd = -1;
-
 // LED
-static int deviceTwinStatusLedGpioFd = -1;
-static bool statusLedOn = false;
+static int doorOneControlGpioFd = -1;
+static int doorTwoControlGpioFd = -1;
+static int doorOneStatusGpioFd = -1;
+static int doorTwoStatusGpioFd = -1;
 
 // Timer / polling
 static int buttonPollTimerFd = -1;
 static int azureTimerFd = -1;
 static int epollFd = -1;
+
+// Door Status Check
+static GPIO_Value_Type doorOneStatus = GPIO_Value_Low;
+static GPIO_Value_Type doorTwoStatus = GPIO_Value_Low;
 
 // Azure IoT poll periods
 static const int AzureIoTDefaultPollPeriodSeconds = 5;
@@ -99,15 +100,9 @@ static const int AzureIoTMaxReconnectPeriodSeconds = 10 * 60;
 
 static int azureIoTPollPeriodSeconds = -1;
 
-// Button state variables
-static GPIO_Value_Type sendMessageButtonState = GPIO_Value_High;
-static GPIO_Value_Type sendOrientationButtonState = GPIO_Value_High;
-
 static void ButtonPollTimerEventHandler(EventData *eventData);
-static bool IsButtonPressed(int fd, GPIO_Value_Type *oldState);
-static void SendMessageButtonHandler(void);
-static void SendOrientationButtonHandler(void);
-static bool deviceIsUp = false; // Orientation
+static void DoorOneStatusChangedHandler(void);
+static void DoorTwoStatusChangedHandler(void);
 static void AzureTimerEventHandler(EventData *eventData);
 
 /// <summary>
@@ -153,7 +148,7 @@ int main(int argc, char *argv[])
 }
 
 /// <summary>
-/// Button timer event:  Check the status of buttons A and B
+/// Button timer event:  Check the status of doors.
 /// </summary>
 static void ButtonPollTimerEventHandler(EventData *eventData)
 {
@@ -161,8 +156,8 @@ static void ButtonPollTimerEventHandler(EventData *eventData)
         terminationRequired = true;
         return;
     }
-    SendMessageButtonHandler();
-    SendOrientationButtonHandler();
+	DoorOneStatusChangedHandler();
+	DoorTwoStatusChangedHandler();
 }
 
 /// <summary>
@@ -179,13 +174,16 @@ static void AzureTimerEventHandler(EventData *eventData)
     if (Networking_IsNetworkingReady(&isNetworkReady) != -1) {
         if (isNetworkReady && !iothubAuthenticated) {
             SetupAzureClient();
+			GPIO_GetValue(doorOneStatusGpioFd, &doorOneStatus);
+			TwinReportStringState("DoorOneStatus", doorOneStatus == GPIO_Value_High ? "Open" : "Closed");
+			GPIO_GetValue(doorTwoStatusGpioFd, &doorTwoStatus);
+			TwinReportStringState("DoorTwoStatus", doorTwoStatus == GPIO_Value_High ? "Open" : "Closed");
         }
     } else {
         Log_Debug("Failed to get Network state\n");
     }
 
     if (iothubAuthenticated) {
-        SendSimulatedTemperature();
         IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
     }
 }
@@ -210,30 +208,38 @@ static int InitPeripheralsAndHandlers(void)
         return -1;
     }
 
-    // Open button A GPIO as input
-    Log_Debug("Opening SAMPLE_BUTTON_1 as input\n");
-    sendMessageButtonGpioFd = GPIO_OpenAsInput(SAMPLE_BUTTON_1);
-    if (sendMessageButtonGpioFd < 0) {
-        Log_Debug("ERROR: Could not open button A: %s (%d).\n", strerror(errno), errno);
+    // Open door one status as input
+    Log_Debug("Opening DOOR_ONE_STATUS as input\n");
+	doorOneStatusGpioFd = GPIO_OpenAsInput(DOOR_ONE_STATUS);
+    if (doorOneStatusGpioFd < 0) {
+        Log_Debug("ERROR: Could not open door one status: %s (%d).\n", strerror(errno), errno);
         return -1;
     }
 
-    // Open button B GPIO as input
-    Log_Debug("Opening SAMPLE_BUTTON_2 as input\n");
-    sendOrientationButtonGpioFd = GPIO_OpenAsInput(SAMPLE_BUTTON_2);
-    if (sendOrientationButtonGpioFd < 0) {
-        Log_Debug("ERROR: Could not open button B: %s (%d).\n", strerror(errno), errno);
+    // Open door two status as input
+    Log_Debug("Opening DOOR_TWO_STATUS as input\n");
+    doorTwoStatusGpioFd = GPIO_OpenAsInput(DOOR_TWO_STATUS);
+    if (doorTwoStatusGpioFd < 0) {
+        Log_Debug("ERROR: Could not open door two status: %s (%d).\n", strerror(errno), errno);
         return -1;
     }
 
     // LED 4 Blue is used to show Device Twin settings state
-    Log_Debug("Opening SAMPLE_LED as output\n");
-    deviceTwinStatusLedGpioFd =
-        GPIO_OpenAsOutput(SAMPLE_LED, GPIO_OutputMode_PushPull, GPIO_Value_High);
-    if (deviceTwinStatusLedGpioFd < 0) {
-        Log_Debug("ERROR: Could not open LED: %s (%d).\n", strerror(errno), errno);
+    Log_Debug("Opening DOOR_ONE_CONTROL as output\n");
+    doorOneControlGpioFd =
+        GPIO_OpenAsOutput(DOOR_ONE_CONTROL, GPIO_OutputMode_PushPull, GPIO_Value_High);
+    if (doorOneControlGpioFd < 0) {
+        Log_Debug("ERROR: Could not open door one control: %s (%d).\n", strerror(errno), errno);
         return -1;
     }
+
+	Log_Debug("Opening DOOR_TWO_CONTROL as output\n");
+	doorTwoControlGpioFd =
+		GPIO_OpenAsOutput(DOOR_TWO_CONTROL, GPIO_OutputMode_PushPull, GPIO_Value_High);
+	if (doorTwoControlGpioFd < 0) {
+		Log_Debug("ERROR: Could not open door two control: %s (%d).\n", strerror(errno), errno);
+		return -1;
+	}
 
     // Set up a timer to poll for button events.
     struct timespec buttonPressCheckPeriod = {0, 1000 * 1000};
@@ -261,16 +267,12 @@ static void ClosePeripheralsAndHandlers(void)
 {
     Log_Debug("Closing file descriptors\n");
 
-    // Leave the LEDs off
-    if (deviceTwinStatusLedGpioFd >= 0) {
-        GPIO_SetValue(deviceTwinStatusLedGpioFd, GPIO_Value_High);
-    }
-
     CloseFdAndPrintError(buttonPollTimerFd, "ButtonTimer");
     CloseFdAndPrintError(azureTimerFd, "AzureTimer");
-    CloseFdAndPrintError(sendMessageButtonGpioFd, "SendMessageButton");
-    CloseFdAndPrintError(sendOrientationButtonGpioFd, "SendOrientationButton");
-    CloseFdAndPrintError(deviceTwinStatusLedGpioFd, "StatusLed");
+    CloseFdAndPrintError(doorOneControlGpioFd, "DoorOneOpen");
+	CloseFdAndPrintError(doorTwoControlGpioFd, "DoorTwoOpen");
+	CloseFdAndPrintError(doorOneStatusGpioFd, "DoorOneStatus");
+	CloseFdAndPrintError(doorTwoStatusGpioFd, "DoorTwoStatus");
     CloseFdAndPrintError(epollFd, "Epoll");
 }
 
@@ -337,58 +339,42 @@ static void SetupAzureClient(void)
         return;
     }
 
-    IoTHubDeviceClient_LL_SetDeviceTwinCallback(iothubClientHandle, TwinCallback, NULL);
+	IoTHubDeviceClient_LL_SetDeviceMethodCallback(iothubClientHandle, MethodCallback, NULL);
     IoTHubDeviceClient_LL_SetConnectionStatusCallback(iothubClientHandle,
                                                       HubConnectionStatusCallback, NULL);
 }
 
-/// <summary>
-///     Callback invoked when a Device Twin update is received from IoT Hub.
-///     Updates local state for 'showEvents' (bool).
-/// </summary>
-/// <param name="payload">contains the Device Twin JSON document (desired and reported)</param>
-/// <param name="payloadSize">size of the Device Twin JSON document</param>
-static void TwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsigned char *payload,
-                         size_t payloadSize, void *userContextCallback)
+static int MethodCallback(const char* methodName, const unsigned char* payload, size_t size, unsigned char** response, size_t* response_size, void* userContextCallback)
 {
-    size_t nullTerminatedJsonSize = payloadSize + 1;
-    char *nullTerminatedJsonString = (char *)malloc(nullTerminatedJsonSize);
-    if (nullTerminatedJsonString == NULL) {
-        Log_Debug("ERROR: Could not allocate buffer for twin update payload.\n");
-        abort();
-    }
+	Log_Debug("Try to invoke method %s", methodName);
+	const char* responseMessage = "\"Successfully invoke device method\"";
+	int result = 200;
 
-    // Copy the provided buffer to a null terminated buffer.
-    memcpy(nullTerminatedJsonString, payload, payloadSize);
-    // Add the null terminator at the end.
-    nullTerminatedJsonString[nullTerminatedJsonSize - 1] = 0;
+	if (strcmp(methodName, "CycleDoorOne") == 0)
+	{
+		const struct timespec sleepTime = { 1, 0 };
+		GPIO_SetValue(doorOneControlGpioFd, GPIO_Value_Low);
+		nanosleep(&sleepTime, NULL);
+		GPIO_SetValue(doorOneControlGpioFd, GPIO_Value_High);
+	}
+	else if (strcmp(methodName, "CycleDoorTwo") == 0)
+	{
+		const struct timespec sleepTime = { 1, 0 };
+		GPIO_SetValue(doorTwoControlGpioFd, GPIO_Value_Low);
+		nanosleep(&sleepTime, NULL);
+		GPIO_SetValue(doorTwoControlGpioFd, GPIO_Value_High);
+	}
+	else
+	{
+		Log_Debug("No method %s found", methodName);
+		responseMessage = "\"No method found\"";
+		result = 404;
+	}
 
-    JSON_Value *rootProperties = NULL;
-    rootProperties = json_parse_string(nullTerminatedJsonString);
-    if (rootProperties == NULL) {
-        Log_Debug("WARNING: Cannot parse the string as JSON content.\n");
-        goto cleanup;
-    }
+	*response_size = strlen(responseMessage) + 1;
+	*response = (unsigned char*)strdup(responseMessage);
 
-    JSON_Object *rootObject = json_value_get_object(rootProperties);
-    JSON_Object *desiredProperties = json_object_dotget_object(rootObject, "desired");
-    if (desiredProperties == NULL) {
-        desiredProperties = rootObject;
-    }
-
-    // Handle the Device Twin Desired Properties here.
-    JSON_Object *LEDState = json_object_dotget_object(desiredProperties, "StatusLED");
-    if (LEDState != NULL) {
-        statusLedOn = (bool)json_object_get_boolean(LEDState, "value");
-        GPIO_SetValue(deviceTwinStatusLedGpioFd,
-                      (statusLedOn == true ? GPIO_Value_Low : GPIO_Value_High));
-        TwinReportBoolState("StatusLED", statusLedOn);
-    }
-
-cleanup:
-    // Release the allocated memory.
-    json_value_free(rootProperties);
-    free(nullTerminatedJsonString);
+	return result;
 }
 
 /// <summary>
@@ -448,145 +434,78 @@ static const char *getAzureSphereProvisioningResultString(
 }
 
 /// <summary>
-///     Sends telemetry to IoT Hub
-/// </summary>
-/// <param name="key">The telemetry item to update</param>
-/// <param name="value">new telemetry value</param>
-static void SendTelemetry(const unsigned char *key, const unsigned char *value)
-{
-    static char eventBuffer[100] = {0};
-    static const char *EventMsgTemplate = "{ \"%s\": \"%s\" }";
-    int len = snprintf(eventBuffer, sizeof(eventBuffer), EventMsgTemplate, key, value);
-    if (len < 0)
-        return;
-
-    Log_Debug("Sending IoT Hub Message: %s\n", eventBuffer);
-
-    IOTHUB_MESSAGE_HANDLE messageHandle = IoTHubMessage_CreateFromString(eventBuffer);
-
-    if (messageHandle == 0) {
-        Log_Debug("WARNING: unable to create a new IoTHubMessage\n");
-        return;
-    }
-
-    if (IoTHubDeviceClient_LL_SendEventAsync(iothubClientHandle, messageHandle, SendMessageCallback,
-                                             /*&callback_param*/ 0) != IOTHUB_CLIENT_OK) {
-        Log_Debug("WARNING: failed to hand over the message to IoTHubClient\n");
-    } else {
-        Log_Debug("INFO: IoTHubClient accepted the message for delivery\n");
-    }
-
-    IoTHubMessage_Destroy(messageHandle);
-}
-
-/// <summary>
-///     Callback confirming message delivered to IoT Hub.
-/// </summary>
-/// <param name="result">Message delivery status</param>
-/// <param name="context">User specified context</param>
-static void SendMessageCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void *context)
-{
-    Log_Debug("INFO: Message received by IoT Hub. Result is: %d\n", result);
-}
-
-/// <summary>
 ///     Creates and enqueues a report containing the name and value pair of a Device Twin reported
 ///     property. The report is not sent immediately, but it is sent on the next invocation of
 ///     IoTHubDeviceClient_LL_DoWork().
 /// </summary>
 /// <param name="propertyName">the IoT Hub Device Twin property name</param>
 /// <param name="propertyValue">the IoT Hub Device Twin property value</param>
-static void TwinReportBoolState(const char *propertyName, bool propertyValue)
+static void TwinReportStringState(const char* propertyName, const char* propertyValue)
 {
-    if (iothubClientHandle == NULL) {
-        Log_Debug("ERROR: client not initialized\n");
-    } else {
-        static char reportedPropertiesString[30] = {0};
-        int len = snprintf(reportedPropertiesString, 30, "{\"%s\":%s}", propertyName,
-                           (propertyValue == true ? "true" : "false"));
-        if (len < 0)
-            return;
+	if (iothubClientHandle == NULL) {
+		Log_Debug("ERROR: client not initialized\n");
+	}
+	else {
+		static char reportedPropertiesString[30] = { 0 };
+		int len = snprintf(reportedPropertiesString, 30, "{\"%s\": \"%s\"}", propertyName, propertyValue);
+		if (len < 0)
+			return;
 
-        if (IoTHubDeviceClient_LL_SendReportedState(
-                iothubClientHandle, (unsigned char *)reportedPropertiesString,
-                strlen(reportedPropertiesString), ReportStatusCallback, 0) != IOTHUB_CLIENT_OK) {
-            Log_Debug("ERROR: failed to set reported state for '%s'.\n", propertyName);
-        } else {
-            Log_Debug("INFO: Reported state for '%s' to value '%s'.\n", propertyName,
-                      (propertyValue == true ? "true" : "false"));
-        }
-    }
+		if (IoTHubDeviceClient_LL_SendReportedState(
+			iothubClientHandle, (unsigned char*)reportedPropertiesString,
+			strlen(reportedPropertiesString), ReportStatusCallback, 0) != IOTHUB_CLIENT_OK) {
+			Log_Debug("ERROR: failed to set reported state for '%s'.\n", propertyName);
+		}
+		else {
+			Log_Debug("INFO: Reported state for '%s' to value '%s'.\n", propertyName, propertyValue);
+		}
+	}
 }
 
 /// <summary>
 ///     Callback invoked when the Device Twin reported properties are accepted by IoT Hub.
 /// </summary>
-static void ReportStatusCallback(int result, void *context)
+static void ReportStatusCallback(int result, void* context)
 {
-    Log_Debug("INFO: Device Twin reported properties update result: HTTP status code %d\n", result);
+	Log_Debug("INFO: Device Twin reported properties update result: HTTP status code %d\n", result);
 }
 
 /// <summary>
-///     Generates a simulated Temperature and sends to IoT Hub.
+/// Opening/Closing door one will:
+///     Send an 'DoorOneStatus' event to Azure IoT Central
 /// </summary>
-void SendSimulatedTemperature(void)
+static void DoorOneStatusChangedHandler(void)
 {
-    static float temperature = 30.0;
-    float deltaTemp = (float)(rand() % 20) / 20.0f;
-    if (rand() % 2 == 0) {
-        temperature += deltaTemp;
-    } else {
-        temperature -= deltaTemp;
-    }
+	GPIO_Value_Type status;
+	int result = GPIO_GetValue(doorOneStatusGpioFd, &status);
+	if (result != 0)
+	{
+		Log_Debug("ERROR: Could not read button GPIO: %s (%d).\n", strerror(errno), errno);
+	}
 
-    char tempBuffer[20];
-    int len = snprintf(tempBuffer, 20, "%3.2f", temperature);
-    if (len > 0)
-        SendTelemetry("Temperature", tempBuffer);
+	if (status != doorOneStatus)
+	{
+		TwinReportStringState("DoorOneStatus", status == GPIO_Value_High ? "Open" : "Closed");
+		doorOneStatus = status;
+	}
 }
 
 /// <summary>
-///     Check whether a given button has just been pressed.
+/// Opening/Closing door two will:
+///     Send an 'DoorTwoStatus' event to Azure IoT Central
 /// </summary>
-/// <param name="fd">The button file descriptor</param>
-/// <param name="oldState">Old state of the button (pressed or released)</param>
-/// <returns>true if pressed, false otherwise</returns>
-static bool IsButtonPressed(int fd, GPIO_Value_Type *oldState)
+static void DoorTwoStatusChangedHandler(void)
 {
-    bool isButtonPressed = false;
-    GPIO_Value_Type newState;
-    int result = GPIO_GetValue(fd, &newState);
-    if (result != 0) {
-        Log_Debug("ERROR: Could not read button GPIO: %s (%d).\n", strerror(errno), errno);
-        terminationRequired = true;
-    } else {
-        // Button is pressed if it is low and different than last known state.
-        isButtonPressed = (newState != *oldState) && (newState == GPIO_Value_Low);
-        *oldState = newState;
-    }
+	GPIO_Value_Type status;
+	int result = GPIO_GetValue(doorTwoStatusGpioFd, &status);
+	if (result != 0)
+	{
+		Log_Debug("ERROR: Could not read button GPIO: %s (%d).\n", strerror(errno), errno);
+	}
 
-    return isButtonPressed;
-}
-
-/// <summary>
-/// Pressing button A will:
-///     Send a 'Button Pressed' event to Azure IoT Central
-/// </summary>
-static void SendMessageButtonHandler(void)
-{
-    if (IsButtonPressed(sendMessageButtonGpioFd, &sendMessageButtonState)) {
-        SendTelemetry("ButtonPress", "True");
-    }
-}
-
-/// <summary>
-/// Pressing button B will:
-///     Send an 'Orientation' event to Azure IoT Central
-/// </summary>
-static void SendOrientationButtonHandler(void)
-{
-    if (IsButtonPressed(sendOrientationButtonGpioFd, &sendOrientationButtonState)) {
-        deviceIsUp = !deviceIsUp;
-        SendTelemetry("Orientation", deviceIsUp ? "Up" : "Down");
-    }
+	if (status != doorTwoStatus)
+	{
+		TwinReportStringState("DoorTwoStatus", status == GPIO_Value_High ? "Open" : "Closed");
+		doorTwoStatus = status;
+	}
 }
